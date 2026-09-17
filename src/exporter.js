@@ -12,6 +12,19 @@ const toDataUrl=async url=>{
 
 const imageType=data=>String(data).startsWith('data:image/png')?'PNG':'JPEG';
 
+const cleanImportedText=value=>String(value||'')
+  .replace(/Ø[=<>][^\s]{1,8}/g,' ')
+  .replace(/[\u0000-\u001f]/g,' ')
+  .replace(/\s+/g,' ')
+  .trim();
+
+const visibleTitle=page=>{
+  const t=String(page?.title||'').trim();
+  if(/^Página\s+\d+$/i.test(t))return '';
+  if(page?.layout_template==='full_image')return '';
+  return t;
+};
+
 const drawImageCover=(doc,data,x,y,w,h)=>{
   if(!data)return;
   const props=doc.getImageProperties(data);
@@ -21,43 +34,110 @@ const drawImageCover=(doc,data,x,y,w,h)=>{
   doc.addImage(data,imageType(data),ix,iy,iw,ih,undefined,'FAST');
 };
 
-const fitText=(doc,text,maxW,maxH,startSize=11,minSize=7.5)=>{
+const drawImageContain=(doc,data,x,y,w,h)=>{
+  if(!data)return;
+  const props=doc.getImageProperties(data);
+  const scale=Math.min(w/props.width,h/props.height);
+  const iw=props.width*scale,ih=props.height*scale;
+  const ix=x+(w-iw)/2,iy=y+(h-ih)/2;
+  doc.addImage(data,imageType(data),ix,iy,iw,ih,undefined,'FAST');
+};
+
+const fitText=(doc,text,maxW,maxH,startSize=10.5,minSize=7.2)=>{
   let size=startSize,lines=[];
-  while(size>=minSize){doc.setFontSize(size);lines=doc.splitTextToSize(text||'',maxW);if(lines.length*size*.43<=maxH)break;size-=.5}
+  while(size>=minSize){
+    doc.setFontSize(size);
+    lines=doc.splitTextToSize(text||'',maxW);
+    const lineHeightMm=size*0.3528*1.35;
+    if(lines.length*lineHeightMm<=maxH)break;
+    size-=0.4;
+  }
   return {size,lines};
 };
 
 const drawText=(doc,page,x,y,w,h)=>{
-  const title=page.title||'';
-  const body=page.body_text||'';
+  const title=visibleTitle(page);
+  const body=cleanImportedText(page.body_text);
   doc.setTextColor(38,32,50);
-  if(title){doc.setFont('helvetica','bold');doc.setFontSize(17);const t=doc.splitTextToSize(title,w);doc.text(t,x,y);y+=t.length*7+4;h-=t.length*7+4}
+  if(title){
+    doc.setFont('helvetica','bold');
+    doc.setFontSize(16);
+    const t=doc.splitTextToSize(title,w);
+    doc.text(t,x,y);
+    const used=t.length*6.3+4;
+    y+=used;
+    h-=used;
+  }
+  if(!body)return;
   doc.setFont('helvetica','normal');
-  const fitted=fitText(doc,body,w,h,10.5,7.5);
-  doc.setFontSize(fitted.size);doc.setLineHeightFactor(1.35);doc.text(fitted.lines,x,y,{maxWidth:w});
+  const fitted=fitText(doc,body,w,h,10.3,7.2);
+  doc.setFontSize(fitted.size);
+  doc.setLineHeightFactor(1.35);
+  doc.text(fitted.lines,x,y,{maxWidth:w});
 };
 
-export async function buildPdf({pages,assetUrls,assets,format='A5_vertical',print=false}){
+const safeLayout=page=>{
+  if(page.page_type==='cover'||page.page_type==='back_cover')return 'full_image';
+  const len=cleanImportedText(page.body_text).length;
+  if(!page.image_asset_id||len>1050)return 'text_focus';
+  if(page.layout_template==='full_image')return 'text_focus';
+  if(len>760)return 'image_top';
+  return page.layout_template||'text_focus';
+};
+
+const preparePages=(pages,sourceType)=>{
+  const list=[...pages];
+  if(String(sourceType||'').toLowerCase()==='pdf'&&list[0]?.page_type==='cover'){
+    const firstContent=list.findIndex(p=>p.page_type==='content');
+    if(firstContent>=0&&/^Página\s*1$/i.test(String(list[firstContent].title||'')))list.splice(firstContent,1);
+  }
+  return list;
+};
+
+export async function buildPdf({pages,assetUrls,assets,format='A5_vertical',print=false,sourceType=null}){
   const base=SIZES[format]||SIZES.A5_vertical;
   const bleed=print?3:0;
   const pageW=base[0]+bleed*2,pageH=base[1]+bleed*2;
   const doc=new jsPDF({orientation:pageW>pageH?'landscape':'portrait',unit:'mm',format:[pageW,pageH],compress:true});
   const cache={};
   const getImage=async id=>{if(!id)return null;if(cache[id])return cache[id];const url=assetUrls[id];if(!url)return null;cache[id]=await toDataUrl(url);return cache[id]};
+  const finalPages=preparePages(pages,sourceType);
 
-  for(let i=0;i<pages.length;i++){
+  for(let i=0;i<finalPages.length;i++){
     if(i)doc.addPage([pageW,pageH],pageW>pageH?'landscape':'portrait');
-    const page=pages[i],img=await getImage(page.image_asset_id);
+    const page=finalPages[i],img=await getImage(page.image_asset_id);
     const x0=bleed,y0=bleed,w=base[0],h=base[1];
-    doc.setFillColor(255,255,255);doc.rect(0,0,pageW,pageH,'F');
+    const layout=safeLayout(page);
+    doc.setFillColor(255,255,255);
+    doc.rect(0,0,pageW,pageH,'F');
 
-    if(page.layout_template==='full_image'&&img){drawImageCover(doc,img,x0,y0,w,h);continue}
-    if(page.layout_template==='image_top'&&img){drawImageCover(doc,img,x0,y0,w,h*.38);drawText(doc,page,x0+12,y0+h*.43,w-24,h*.52);continue}
-    if(page.layout_template==='image_side'&&img){drawImageCover(doc,img,x0+w*.60,y0,w*.40,h);drawText(doc,page,x0+12,y0+16,w*.50,h-30);continue}
-    if(img){drawImageCover(doc,img,x0+w*.66,y0+12,w*.27,h*.24);drawText(doc,page,x0+12,y0+18,w*.57,h-30)}
-    else drawText(doc,page,x0+14,y0+20,w-28,h-36);
+    if(layout==='full_image'&&img){
+      drawImageCover(doc,img,x0,y0,w,h);
+    }else if(layout==='image_top'&&img){
+      drawImageContain(doc,img,x0+12,y0+10,w-24,h*.28);
+      drawText(doc,page,x0+13,y0+h*.34,w-26,h*.58);
+    }else if(layout==='image_side'&&img){
+      drawImageContain(doc,img,x0+w*.60,y0+16,w*.32,h*.34);
+      drawText(doc,page,x0+13,y0+18,w*.43,h-36);
+    }else{
+      if(img&&cleanImportedText(page.body_text).length<620)drawImageContain(doc,img,x0+w*.68,y0+14,w*.22,h*.20);
+      drawText(doc,page,x0+14,y0+20,img&&cleanImportedText(page.body_text).length<620?w*.58:w-28,h-38);
+    }
 
-    if(print){doc.setDrawColor(120);doc.setLineWidth(.15);const m=2;doc.line(0,bleed,bleed-m,bleed);doc.line(bleed,0,bleed,bleed-m);doc.line(pageW-bleed+m,bleed,pageW,bleed);doc.line(pageW-bleed,0,pageW-bleed,bleed-m);doc.line(0,pageH-bleed,bleed-m,pageH-bleed);doc.line(bleed,pageH-bleed+m,bleed,pageH);doc.line(pageW-bleed+m,pageH-bleed,pageW,pageH-bleed);doc.line(pageW-bleed,pageH-bleed+m,pageW-bleed,pageH)}
+    if(page.page_type==='content'){
+      doc.setFont('helvetica','normal');
+      doc.setFontSize(7.5);
+      doc.setTextColor(130,124,145);
+      doc.text(String(i+1),x0+w/2,y0+h-7,{align:'center'});
+    }
+
+    if(print){
+      doc.setDrawColor(120);doc.setLineWidth(.15);const m=2;
+      doc.line(0,bleed,bleed-m,bleed);doc.line(bleed,0,bleed,bleed-m);
+      doc.line(pageW-bleed+m,bleed,pageW,bleed);doc.line(pageW-bleed,0,pageW-bleed,bleed-m);
+      doc.line(0,pageH-bleed,bleed-m,pageH-bleed);doc.line(bleed,pageH-bleed+m,bleed,pageH);
+      doc.line(pageW-bleed+m,pageH-bleed,pageW,pageH-bleed);doc.line(pageW-bleed,pageH-bleed+m,pageW-bleed,pageH);
+    }
   }
   return doc.output('blob');
 }
@@ -73,8 +153,8 @@ const imageToPngBlob=async(url,{mockup=false}={})=>{
 export async function exportFile({supabase,session,project,ebook,pages,assets,assetUrls,format,type}){
   if(!project||!ebook)throw new Error('Projeto não carregado.');
   let blob,ext='pdf';
-  if(type==='pdf_digital')blob=await buildPdf({pages,assetUrls,assets,format,print:false});
-  else if(type==='pdf_print')blob=await buildPdf({pages,assetUrls,assets,format,print:true});
+  if(type==='pdf_digital')blob=await buildPdf({pages,assetUrls,assets,format,print:false,sourceType:ebook.source_type});
+  else if(type==='pdf_print')blob=await buildPdf({pages,assetUrls,assets,format,print:true,sourceType:ebook.source_type});
   else{
     ext='png';
     const requested=type==='cover_png'?'cover':'mockup';
